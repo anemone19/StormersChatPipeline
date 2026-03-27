@@ -9,6 +9,7 @@ start_time <- Sys.time()
 ```
 
 ```{r packages}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
 required_pkgs <- c("DBI", "RPostgres", "httr2", "dplyr", "purrr",
                    "tibble", "glue", "dotenv", "knitr")
 invisible(lapply(required_pkgs, function(pkg) {
