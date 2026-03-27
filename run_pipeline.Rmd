@@ -209,7 +209,7 @@ matches <- bind_rows(
 
 # Upsert matches table without dropping the FK parent
 upsert_table(con, "matches", matches, "match_id")
-log_count("matches", nrow(matches), nrow(matches))
+log_count("matches", nrow(matches), table_row_count(con, "matches"))
 
 finalised_ids     <- matches$match_id[matches$finalised == 1 & !is.na(matches$finalised)]
 stormers_match_ids <- matches$match_id[
@@ -484,6 +484,10 @@ if (length(new_ids) > 0) {
   log_count("match_quarters",     n_qtrs, end_qtrs)
 
 } else {
+  log_count("player_match_stats", 0L, tryCatch(table_row_count(con, "player_match_stats"), error = function(e) 0L))
+  log_count("match_team_stats",   0L, tryCatch(table_row_count(con, "match_team_stats"),   error = function(e) 0L))
+  log_count("match_events",       0L, tryCatch(table_row_count(con, "match_events"),       error = function(e) 0L))
+  log_count("match_quarters",     0L, tryCatch(table_row_count(con, "match_quarters"),     error = function(e) 0L))
   message("  ✓ No new matches to process")
 }
 ```
@@ -540,6 +544,7 @@ if (length(new_h2h_ids) > 0) {
   if (end_h2h < start_h2h + n_h2h) warning("head_to_head count is lower than expected after append.")
   log_count("head_to_head", n_h2h, end_h2h)
 } else {
+  log_count("head_to_head", 0L, tryCatch(table_row_count(con, "head_to_head"), error = function(e) 0L))
   message("  ✓ head_to_head: no new Stormers matches")
 }
 ```
