@@ -856,15 +856,38 @@ log_count("team_top_stats", nrow(team_top_stats), table_row_count(con, "team_top
 ## Summary
 
 ```{r summary_table}
-dbDisconnect(con)
 elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "mins")), 1)
 
-summary_df <- tibble(
-  Table                = names(counts),
-  `New rows added`     = sapply(counts, `[[`, "new"),
-  `Total rows in DB`   = sapply(counts, `[[`, "total")
+table_order <- c(
+  "matches", "player_match_stats", "match_team_stats", "match_events",
+  "match_quarters", "head_to_head", "standings", "round_standings",
+  "season_stats", "squad", "venues", "officials", "player_top10",
+  "team_top_stats"
 )
+
+summary_df <- tibble(
+  Table = table_order,
+  `New rows added` = vapply(
+    table_order,
+    function(tbl) if (!is.null(counts[[tbl]])) counts[[tbl]]$new else 0L,
+    numeric(1)
+  ),
+  `Total rows in DB` = vapply(
+    table_order,
+    function(tbl) tryCatch(table_row_count(con, tbl), error = function(e) NA_real_),
+    numeric(1)
+  )
+)
+
+db_info <- tryCatch(
+  dbGetQuery(con, "SELECT current_database() AS database_name, current_schema() AS schema_name"),
+  error = function(e) tibble(database_name = NA_character_, schema_name = NA_character_)
+)
+
+dbDisconnect(con)
+
 knitr::kable(summary_df, format = "html")
+knitr::kable(db_info, format = "html")
 ```
 
 **Run completed in `r elapsed` minutes at `r format(Sys.time(), "%Y-%m-%d %H:%M %Z")`.**
