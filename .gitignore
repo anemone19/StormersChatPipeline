@@ -1,0 +1,40 @@
+# ── Credentials ────────────────────────────────────────────────────
+.env
+*.env.local
+
+# ── R ──────────────────────────────────────────────────────────────
+.Rhistory
+.RData
+.Rproj.user/
+renv/library/
+
+# ── Large data files ───────────────────────────────────────────────
+# All CSVs and databases are in misc/ (legacy) — never commit large data
+misc/data/
+data/*.csv
+data/*.db
+data/*.sqlite
+*.db
+*.sqlite
+
+# ── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── Jupyter ────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── IDE / OS ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+.spyproject/
+.DS_Store
+*.log

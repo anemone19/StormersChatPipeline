@@ -1,0 +1,864 @@
+---
+title: "StormersChat — Data Pipeline"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+start_time <- Sys.time()
+```
+
+```{r packages}
+required_pkgs <- c("DBI", "RPostgres", "httr2", "dplyr", "purrr",
+                   "tibble", "glue", "dotenv", "knitr")
+invisible(lapply(required_pkgs, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, quiet = TRUE)
+  library(pkg, character.only = TRUE)
+}))
+```
+
+```{r credentials}
+# Load .env locally; on Posit Connect these come from the Vars panel
+local_env <- "backend/.env"
+if (file.exists(local_env)) dotenv::load_dot_env(local_env)
+
+BASE_URL    <- Sys.getenv("OVAL_INSIGHTS_BASE_URL", "https://api.rugbyviz.com/rugby/v1")
+USERNAME    <- Sys.getenv("OVAL_INSIGHTS_USERNAME")
+PASSWORD    <- Sys.getenv("OVAL_INSIGHTS_PASSWORD")
+URC_ID      <- as.integer(Sys.getenv("OVAL_URC_COMP_ID",           "1068"))
+CHAMPS_ID   <- as.integer(Sys.getenv("OVAL_CHAMPIONS_CUP_COMP_ID", "1008"))
+SEASON_ID   <- as.integer(Sys.getenv("OVAL_CURRENT_SEASON_ID",     "202501"))
+STORMERS_ID <- as.integer(Sys.getenv("OVAL_STORMERS_TEAM_ID",      "3994"))
+
+stopifnot(
+  "OVAL_INSIGHTS_USERNAME not set" = nchar(USERNAME) > 0,
+  "OVAL_INSIGHTS_PASSWORD not set" = nchar(PASSWORD) > 0
+)
+```
+
+```{r db_connect}
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = Sys.getenv("PG_HOST"),
+  port     = as.integer(Sys.getenv("PG_PORT", "5432")),
+  dbname   = Sys.getenv("PG_DBNAME"),
+  user     = Sys.getenv("PG_USER"),
+  password = Sys.getenv("PG_PASSWORD")
+)
+```
+
+```{r helpers}
+# ── API helper ────────────────────────────────────────────────────────────────
+oval_get <- function(endpoint, quiet = TRUE) {
+  url <- paste0(BASE_URL, endpoint)
+  tryCatch({
+    request(url) |>
+      req_auth_basic(USERNAME, PASSWORD) |>
+      req_headers(Accept = "application/json") |>
+      req_timeout(30) |>
+      req_retry(max_tries = 3, backoff = ~ 2) |>
+      req_perform() |>
+      resp_body_json(simplifyVector = FALSE)
+  }, error = function(e) {
+    message(glue("  ✗ Failed: {endpoint} — {e$message}"))
+    NULL
+  })
+}
+
+# ── Type-safe extractors ──────────────────────────────────────────────────────
+safe_int <- function(x) if (is.null(x) || length(x) == 0) NA_integer_ else as.integer(x[[1]])
+safe_chr <- function(x) if (is.null(x) || length(x) == 0) NA_character_ else as.character(x[[1]])
+safe_dbl <- function(x) if (is.null(x) || length(x) == 0) NA_real_     else as.double(x[[1]])
+safe_lgl <- function(x) if (is.null(x) || length(x) == 0) NA_integer_  else as.integer(as.logical(x[[1]]))
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# ── Row count tracker ─────────────────────────────────────────────────────────
+counts <- list()
+log_count <- function(table, n_new, n_total) {
+  counts[[table]] <<- list(new = n_new, total = n_total)
+  message(glue("  ✓ {table}: +{n_new} new rows  ({n_total} total)"))
+}
+
+table_row_count <- function(con, table_name) {
+  table_id <- dbQuoteIdentifier(con, table_name)
+  dbGetQuery(con, glue("SELECT COUNT(*) AS n FROM {table_id}"))$n[[1]]
+}
+
+# ── DB write helpers ───────────────────────────────────────────────────────────
+# Use for tables that have FK children pointing to them (e.g. matches):
+# writes via INSERT ... ON CONFLICT DO UPDATE so the table is never dropped.
+upsert_table <- function(con, table_name, df, pk_col) {
+  if (ncol(df) == 0) {
+    stop(glue("Refusing to upsert {table_name}: data frame has no columns. Check the upstream API response shape."))
+  }
+  tmp <- paste0(table_name, "_tmp_", sample(1000:9999, 1))
+  dbWriteTable(con, tmp, df, temporary = TRUE, overwrite = TRUE, row.names = FALSE)
+  cols <- paste(names(df), collapse = ", ")
+  upd  <- paste(
+    setdiff(names(df), pk_col),
+    paste0("EXCLUDED.", setdiff(names(df), pk_col)),
+    sep  = " = ", collapse = ", "
+  )
+  dbExecute(con, glue(
+    "INSERT INTO {table_name} ({cols}) SELECT {cols} FROM {tmp} ",
+    "ON CONFLICT ({pk_col}) DO UPDATE SET {upd}"
+  ))
+  dbExecute(con, glue("DROP TABLE IF EXISTS {tmp}"))
+  invisible(NULL)
+}
+
+# Use for season-level refresh tables with no FK children pointing to them:
+# TRUNCATE empties the table without touching the schema or constraints.
+refresh_table <- function(con, table_name, df) {
+  if (ncol(df) == 0) {
+    stop(glue("Refusing to refresh {table_name}: data frame has no columns. Check the upstream API response shape before truncating the table."))
+  }
+  dbExecute(con, glue("TRUNCATE TABLE {table_name}"))
+  if (nrow(df) > 0) dbAppendTable(con, table_name, df)
+  invisible(NULL)
+}
+
+ensure_text_column <- function(con, table_name, column_name) {
+  col_info <- dbGetQuery(
+    con,
+    glue(
+      "SELECT data_type
+       FROM information_schema.columns
+       WHERE table_schema = current_schema()
+         AND table_name = {dbQuoteString(con, table_name)}
+         AND column_name = {dbQuoteString(con, column_name)}"
+    )
+  )
+  if (nrow(col_info) == 0) {
+    warning(glue("Column {table_name}.{column_name} not found in current schema."))
+    return(invisible(FALSE))
+  }
+  if (identical(col_info$data_type[[1]], "text")) return(invisible(FALSE))
+
+  table_id  <- dbQuoteIdentifier(con, table_name)
+  column_id <- dbQuoteIdentifier(con, column_name)
+  message(glue("  ! Altering {table_name}.{column_name} to TEXT to match the pipeline schema"))
+  dbExecute(
+    con,
+    glue("ALTER TABLE {table_id} ALTER COLUMN {column_id} TYPE TEXT USING {column_id}::text")
+  )
+  invisible(TRUE)
+}
+
+# Fresh DB connection — call this to reconnect after long API loops
+pg_connect <- function() {
+  dbConnect(
+    RPostgres::Postgres(),
+    host     = Sys.getenv("PG_HOST"),
+    port     = as.integer(Sys.getenv("PG_PORT", "5432")),
+    dbname   = Sys.getenv("PG_DBNAME"),
+    user     = Sys.getenv("PG_USER"),
+    password = Sys.getenv("PG_PASSWORD")
+  )
+}
+```
+
+## 1. Matches
+
+```{r fetch_matches}
+fetch_matches <- function(comp_id, comp_name) {
+  raw <- oval_get(glue("/match/search?compId={comp_id}&seasonId={SEASON_ID}"))
+  if (is.null(raw)) return(tibble())
+  map_dfr(raw, function(m) {
+    venue_country_val <- if (is.list(m$venue$country)) safe_chr(m$venue$country$name)
+                         else safe_chr(m$venue$country)
+    tibble(
+      match_id          = safe_int(m$id),
+      date_time         = safe_chr(m$dateTime),
+      season_id         = safe_int(m$season$id),
+      season_name       = safe_chr(m$season$name),
+      competition_id    = comp_id,
+      competition       = comp_name,
+      round             = safe_int(m$round),
+      match_status      = safe_chr(m$matchStatus),
+      finalised         = safe_lgl(m$finalised),
+      home_team_id      = safe_int(m$homeTeam$id),
+      home_team         = safe_chr(m$homeTeam$name),
+      home_team_short   = safe_chr(m$homeTeam$shortName),
+      home_team_abbr    = safe_chr(m$homeTeam$abbreviatedName),
+      home_score_ht     = safe_int(m$homeTeam$score$htScore),
+      home_score_ft     = safe_int(m$homeTeam$score$finalScore),
+      away_team_id      = safe_int(m$awayTeam$id),
+      away_team         = safe_chr(m$awayTeam$name),
+      away_team_short   = safe_chr(m$awayTeam$shortName),
+      away_team_abbr    = safe_chr(m$awayTeam$abbreviatedName),
+      away_score_ht     = safe_int(m$awayTeam$score$htScore),
+      away_score_ft     = safe_int(m$awayTeam$score$finalScore),
+      winner_team_id    = safe_int(m$matchWinner),
+      venue             = safe_chr(m$venue$name),
+      venue_id          = safe_int(m$venue$id),
+      venue_country     = venue_country_val,
+      venue_timezone    = safe_chr(m$venue$timezone),
+      venue_floodlit    = safe_lgl(m$venue$floodlit),
+      neutral_venue     = safe_lgl(m$venue$neutralVenue),
+      attendance        = safe_int(m$attendance)
+    )
+  })
+}
+
+matches <- bind_rows(
+  fetch_matches(URC_ID,    "United Rugby Championship"),
+  fetch_matches(CHAMPS_ID, "European Rugby Champions Cup")
+)
+
+# Upsert matches table without dropping the FK parent
+upsert_table(con, "matches", matches, "match_id")
+log_count("matches", nrow(matches), nrow(matches))
+
+finalised_ids     <- matches$match_id[matches$finalised == 1 & !is.na(matches$finalised)]
+stormers_match_ids <- matches$match_id[
+  (matches$home_team_id == STORMERS_ID | matches$away_team_id == STORMERS_ID) &
+    matches$finalised == 1 & !is.na(matches$finalised)
+]
+```
+
+## 2. Match-Level Stats (incremental)
+
+```{r new_match_ids}
+# Find which finalised matches are NOT yet in the DB
+existing_ids <- tryCatch(
+  dbGetQuery(con, "SELECT DISTINCT match_id FROM player_match_stats")$match_id,
+  error = function(e) integer(0)
+)
+new_ids <- setdiff(finalised_ids, existing_ids)
+message(glue("  Finalised: {length(finalised_ids)}  |  Already loaded: {length(existing_ids)}  |  New: {length(new_ids)}"))
+```
+
+```{r extract_fns}
+extract_player_stats <- function(p, match_id, team_id, team_name, is_home) {
+  s <- p$stats
+  tibble(
+    match_id = match_id, player_id = safe_int(p$id), player_name = safe_chr(p$name),
+    team_id = team_id, team_name = team_name, is_home_team = as.integer(is_home),
+    position_id = safe_int(p$position$id), position_name = safe_chr(p$position$name),
+    shirt_number = safe_int(p$position$shirtNumber),
+    minutes_played = safe_int(s$scoring$minutesPlayed),
+    minutes_played_first_half = safe_int(s$scoring$minutesPlayedFirstHalf),
+    minutes_played_second_half = safe_int(s$scoring$minutesPlayedSecondHalf),
+    tries_scored = safe_int(s$scoring$tryScored), points_scored = safe_int(s$scoring$points),
+    conversions_made = safe_int(s$scoring$conversion), penalties_made = safe_int(s$scoring$penaltyGoal),
+    drop_goals_made = safe_int(s$scoring$dropGoal),
+    penalties_conceded = safe_int(s$discipline$penaltyConceded),
+    yellow_cards = safe_int(s$discipline$yellowCard), red_cards = safe_int(s$discipline$redCard),
+    carries = safe_int(s$attack$carries), metres_made = safe_int(s$attack$metresMade),
+    passes = safe_int(s$attack$passes), defenders_beaten = safe_int(s$attack$defenderBeaten),
+    crossed_gainline = safe_int(s$attack$crossedGainline),
+    failed_gainline = safe_int(s$attack$failedGainline),
+    turnovers_conceded = safe_int(s$attack$totalTurnovers),
+    post_contact_metres = safe_int(s$attack$postContactMetres),
+    try_assists = safe_int(s$attack$tryAssist), break_assists = safe_int(s$attack$breakAssist),
+    tackles_made = safe_int(s$defence$totalSuccessfulTackles),
+    tackles_missed = safe_int(s$defence$totalUnsuccessfulTackles),
+    total_tackles_attempted = safe_int(s$defence$totalAttemptedTackles),
+    tackle_success_pct = safe_dbl(s$defence$percentTackleMade),
+    turnovers_won = safe_int(s$defence$turnoverWon),
+    jackals = safe_int(s$defence$jackalPenaltyWon),
+    dominant_tackles = safe_int(s$defence$dominantTackleContact),
+    lineout_throws_won = safe_int(s$lineout$lineoutThrowsWon),
+    lineout_throws_lost = safe_int(s$lineout$lineoutLost),
+    lineout_won_clean = safe_int(s$lineout$wonClean), lineout_won_other = safe_int(s$lineout$wonOther),
+    throw_front = safe_int(s$lineout$throwFront), throw_middle = safe_int(s$lineout$throwMiddle),
+    throw_back = safe_int(s$lineout$throwBack),
+    kicks_in_play = safe_int(s$kicking$kicksInPlay), kick_metres = safe_int(s$kicking$kickMetres),
+    territorial_kicks = safe_int(s$kicking$territorial),
+    ruck_entries_attacking = safe_int(s$rucks$attackingRuckEntries),
+    ruck_entries_defensive = safe_int(s$rucks$defensiveRuckEntries),
+    ruck_entries_total = safe_int(s$rucks$totalRuckEntries), ruck_nuisance = safe_int(s$rucks$nuisance),
+    scrum_involvement_total = safe_int(s$scrum$totalScrumInvolvement),
+    scrum_won_total = safe_int(s$scrum$attackScrumTotalWon),
+    scrum_won_penalty = safe_int(s$scrum$attackScrumWonPenalty),
+    scrum_won_outright = safe_int(s$scrum$attackScrumWonOutright),
+    defensive_catches = safe_int(s$ballReception$defensiveCatch),
+    defensive_catch_success = safe_int(s$ballReception$defensiveCatchSuccess),
+    restart_catches = safe_int(s$ballReception$restartCatch),
+    restart_catch_success = safe_int(s$ballReception$restartCatchSuccess)
+  )
+}
+
+extract_team_stats <- function(team_data, match_id, is_home) {
+  t <- team_data$team
+  s <- team_data$teamStats
+  if (is.null(s)) return(tibble())
+  lineout_won  <- safe_int(s$lineout$lineoutThrowsWon)
+  lineout_lost <- safe_int(s$lineout$lineoutThrowsLost)
+  scrum_won    <- safe_int(s$scrum$scrumsWon)
+  scrum_total  <- safe_int(s$scrum$totalScrums)
+  tibble(
+    match_id = match_id, team_id = safe_int(t$id), team_name = safe_chr(t$name),
+    is_home_team = as.integer(is_home),
+    carries = safe_int(s$attack$carries), metres_made = safe_int(s$attack$metresMade),
+    passes = safe_int(s$attack$passes), defenders_beaten = safe_int(s$attack$defenderBeaten),
+    clean_breaks = safe_int(s$attack$cleanBreak),
+    crossed_gainline = safe_int(s$attack$crossedGainline),
+    failed_gainline = safe_int(s$attack$failedGainline),
+    offloads = safe_int(s$attack$offload), post_contact_metres = safe_int(s$attack$postContactMetres),
+    try_assists = safe_int(s$attack$tryAssist),
+    tries_scored = safe_int(s$scoring$tryScored), points_scored = safe_int(s$scoring$points),
+    conversions_made = safe_int(s$scoring$conversion), penalties_made = safe_int(s$scoring$penaltyGoal),
+    tackles_made = safe_int(s$defence$totalSuccessfulTackles),
+    tackles_missed = safe_int(s$defence$totalUnsuccessfulTackles),
+    total_tackles_attempted = safe_int(s$defence$totalAttemptedTackles),
+    tackle_success_pct = safe_dbl(s$defence$percentTackleMade),
+    turnovers_won = safe_int(s$defence$turnoverWon),
+    dominant_tackles = safe_int(s$defence$dominantTackleContact),
+    lineout_throws_won = lineout_won, lineout_throws_lost = lineout_lost,
+    lineout_success_pct = if (!is.na(lineout_won) && !is.na(lineout_lost) && (lineout_won + lineout_lost) > 0)
+                            round(lineout_won * 100 / (lineout_won + lineout_lost), 1)
+                          else safe_dbl(s$lineout$percentLineoutsWon),
+    scrum_won = scrum_won,
+    scrum_lost = if (!is.na(scrum_total) && !is.na(scrum_won)) as.integer(scrum_total - scrum_won) else NA_integer_,
+    scrum_success_pct = safe_dbl(s$scrum$percentScrumsWon),
+    kicks_in_play = safe_int(s$kicking$kicksInPlay), kick_metres = safe_int(s$kicking$kickMetres),
+    penalties_conceded = safe_int(s$discipline$penaltyConceded),
+    rucks_won = safe_int(s$possession$numRucksWon), rucks_lost = safe_int(s$possession$numRucksLost),
+    mauls_won = safe_int(s$possession$maulsWon), mauls_lost = safe_int(s$possession$maulsLost),
+    maul_success_pct = safe_dbl(s$possession$percentMaulsWon),
+    visits_to_22 = safe_int(s$possession$numVisitsTo22),
+    points_from_22_visits = safe_int(s$possession$pointsFromVisitsTo22),
+    possession_pct = safe_dbl(s$possession$percentPossession),
+    possession_pct_fh = safe_dbl(s$possession$percentPossessionFirstHalf),
+    possession_pct_sh = safe_dbl(s$possession$percentPossessionSecondHalf),
+    territory_pct = safe_dbl(s$possession$percentTerritory),
+    territory_pct_fh = safe_dbl(s$possession$percentTerritoryFirstHalf),
+    territory_pct_sh = safe_dbl(s$possession$percentTerritorySecondHalf),
+    total_restarts = safe_int(s$restart$totalRestarts),
+    restarts_retained = safe_int(s$restart$restartsRetained),
+    restarts_50m = safe_int(s$restart$restart50m),
+    restarts_goal_line = safe_int(s$restart$restartGoalLine),
+    restart_success_pct = safe_dbl(s$restart$percentRestartsRetained),
+    attacking_catches = safe_int(s$ballReception$attackingCatch),
+    attacking_catch_success = safe_int(s$ballReception$attackingCatchSuccess),
+    defensive_catches = safe_int(s$ballReception$defensiveCatch),
+    defensive_catch_success = safe_int(s$ballReception$defensiveCatchSuccess),
+    restart_catches = safe_int(s$ballReception$restartCatch),
+    restart_catch_success = safe_int(s$ballReception$restartCatchSuccess),
+    aerial_contests = safe_int(s$ballReception$aerialContest),
+    aerial_contests_won = safe_int(s$ballReception$aerialContestWon),
+    aerial_contest_pct = safe_dbl(s$ballReception$percentAerialContestWon)
+  )
+}
+```
+
+```{r fetch_match_stats}
+if (length(new_ids) > 0) {
+  n_pms <- 0L; n_mts <- 0L; n_evt <- 0L; n_qtrs <- 0L
+
+  # Older DB versions may still have match_events.time typed as numeric.
+  # Rugby injury-time strings such as "80+1" must be stored as text.
+  ensure_text_column(con, "match_events", "time")
+
+  start_pms  <- tryCatch(table_row_count(con, "player_match_stats"), error = function(e) 0L)
+  start_mts  <- tryCatch(table_row_count(con, "match_team_stats"),   error = function(e) 0L)
+  start_evt  <- tryCatch(table_row_count(con, "match_events"),       error = function(e) 0L)
+  start_qtrs <- tryCatch(table_row_count(con, "match_quarters"),     error = function(e) 0L)
+
+  # Load existing player IDs once — updated in-memory as we insert new players
+  known_player_ids <- tryCatch(
+    dbGetQuery(con, "SELECT player_id FROM players")$player_id,
+    error = function(e) integer(0)
+  )
+
+  for (mid in new_ids) {
+    # ── Match stats (players + teams) — write immediately ─────────────────────
+    raw <- oval_get(glue("/matchstats/{mid}"))
+    if (!is.null(raw)) {
+      pms_rows <- list(); mts_rows <- list(); match_player_rows <- list()
+      for (side in list(list(data = raw$homeTeam, is_home = TRUE),
+                        list(data = raw$awayTeam, is_home = FALSE))) {
+        if (is.null(side$data)) next
+        tid   <- safe_int(side$data$team$id)
+        tname <- safe_chr(side$data$team$name)
+        tryCatch(
+          mts_rows[[length(mts_rows) + 1]] <- extract_team_stats(side$data, mid, side$is_home),
+          error = function(e) NULL
+        )
+        for (p in side$data$players) {
+          match_player_rows[[length(match_player_rows) + 1]] <- tibble(
+            player_id  = safe_int(p$id), name = safe_chr(p$name),
+            known_name = safe_chr(p$knownName), first_name = safe_chr(p$firstName),
+            last_name  = safe_chr(p$lastName)
+          )
+          tryCatch(
+            pms_rows[[length(pms_rows) + 1]] <-
+              extract_player_stats(p, mid, tid, tname, side$is_home),
+            error = function(e) NULL
+          )
+        }
+      }
+      # ── Write players FIRST (FK parent of player_match_stats) ───────────────
+      match_players <- if (length(match_player_rows) > 0) {
+        bind_rows(match_player_rows) |> distinct(player_id, .keep_all = TRUE)
+      } else {
+        tibble(
+          player_id = integer(),
+          name = character(),
+          known_name = character(),
+          first_name = character(),
+          last_name = character()
+        )
+      }
+      truly_new <- match_players |> filter(!player_id %in% known_player_ids)
+      if (nrow(truly_new) > 0) {
+        dbAppendTable(con, "players", truly_new)
+        known_player_ids <- c(known_player_ids, truly_new$player_id)
+      }
+      # ── Then write player_match_stats and match_team_stats ───────────────────
+      match_pms <- bind_rows(pms_rows)
+      match_mts <- bind_rows(mts_rows)
+      if (nrow(match_pms) > 0) { dbAppendTable(con, "player_match_stats", match_pms); n_pms <- n_pms + nrow(match_pms) }
+      if (nrow(match_mts) > 0) { dbAppendTable(con, "match_team_stats",   match_mts); n_mts <- n_mts + nrow(match_mts) }
+    }
+
+    # ── Match events — write immediately ──────────────────────────────────────
+    ev_raw <- oval_get(glue("/matchevents/{mid}"))
+    if (!is.null(ev_raw)) {
+      events_raw <- if (!is.null(ev_raw$events)) ev_raw$events else ev_raw
+      if (is.list(events_raw) && length(events_raw) > 0) {
+        rows <- map_dfr(events_raw, function(e) {
+          period_val <- if (!is.null(e$period) && is.list(e$period)) e$period$name else e$period
+          props_str  <- if (!is.null(e$properties) && length(e$properties) > 0)
+            paste(sapply(e$properties, function(p) paste0(
+              if (!is.null(p$name)) as.character(p$name) else "",
+              "=",
+              if (!is.null(p$value)) as.character(p$value) else ""
+            )), collapse = " | ") else NA_character_
+          tibble(
+            match_id = mid, event_id = safe_int(e$id),
+            event_type = safe_chr(e$type$name), event_type_id = safe_int(e$type$id),
+            time = safe_chr(e$time), minute = safe_int(e$minute), second = safe_int(e$second),
+            period = safe_chr(period_val),
+            team_id = safe_int(e$team$id), team_name = safe_chr(e$team$name),
+            player_id = safe_int(e$player$id), player_name = safe_chr(e$player$name),
+            score_home = safe_int(e$homeScore), score_away = safe_int(e$awayScore),
+            start_x = safe_dbl(e$startX), start_y = safe_dbl(e$startY),
+            end_x = safe_dbl(e$endX), end_y = safe_dbl(e$endY),
+            direction = safe_chr(e$direction), properties = props_str,
+            is_deleted = safe_lgl(e$isDeleted),
+            timestamp = safe_chr(e$timestamp), last_modified = safe_chr(e$lastModified)
+          )
+        })
+        if (nrow(rows) > 0) { dbAppendTable(con, "match_events", rows); n_evt <- n_evt + nrow(rows) }
+      }
+    }
+
+    # ── Match quarters — write immediately ────────────────────────────────────
+    for (qtr in c("q1", "q2", "q3", "q4")) {
+      q_raw <- oval_get(glue("/matchquarters/{mid}?quarter={qtr}"))
+      if (is.null(q_raw)) next
+      qtr_key   <- paste0("stats", toupper(substring(qtr, 1, 1)), substring(qtr, 2))
+      stats_raw <- q_raw[[qtr_key]]
+      if (is.null(stats_raw) || length(stats_raw) == 0) next
+      rows <- map_dfr(stats_raw, function(s) tibble(
+        match_id = mid, quarter = qtr,
+        home_team_id = safe_int(q_raw$homeTeam$id), home_team_name = safe_chr(q_raw$homeTeam$name),
+        away_team_id = safe_int(q_raw$awayTeam$id), away_team_name = safe_chr(q_raw$awayTeam$name),
+        stat_key = safe_chr(s$key), stat_label = safe_chr(s$label),
+        home_value = safe_dbl(s$homeValue), away_value = safe_dbl(s$awayValue),
+        home_share_pct = safe_dbl(s$homeMatchSharePercentage),
+        away_share_pct = safe_dbl(s$awayMatchSharePercentage)
+      ))
+      if (nrow(rows) > 0) { dbAppendTable(con, "match_quarters", rows); n_qtrs <- n_qtrs + nrow(rows) }
+    }
+    message(glue("  ✓ match {mid}"))
+  }
+
+  end_pms  <- tryCatch(table_row_count(con, "player_match_stats"), error = function(e) start_pms + n_pms)
+  end_mts  <- tryCatch(table_row_count(con, "match_team_stats"),   error = function(e) start_mts + n_mts)
+  end_evt  <- tryCatch(table_row_count(con, "match_events"),       error = function(e) start_evt + n_evt)
+  end_qtrs <- tryCatch(table_row_count(con, "match_quarters"),     error = function(e) start_qtrs + n_qtrs)
+
+  if (end_pms  < start_pms  + n_pms)  warning("player_match_stats count is lower than expected after append.")
+  if (end_mts  < start_mts  + n_mts)  warning("match_team_stats count is lower than expected after append.")
+  if (end_evt  < start_evt  + n_evt)  warning("match_events count is lower than expected after append.")
+  if (end_qtrs < start_qtrs + n_qtrs) warning("match_quarters count is lower than expected after append.")
+
+  log_count("player_match_stats", n_pms, end_pms)
+  log_count("match_team_stats",   n_mts, end_mts)
+  log_count("match_events",       n_evt, end_evt)
+  log_count("match_quarters",     n_qtrs, end_qtrs)
+
+} else {
+  message("  ✓ No new matches to process")
+}
+```
+
+## 3. Head-to-Head (Stormers matches, incremental)
+
+```{r fetch_h2h}
+existing_h2h <- tryCatch(
+  dbGetQuery(con, "SELECT match_id FROM head_to_head")$match_id,
+  error = function(e) integer(0)
+)
+new_h2h_ids <- setdiff(stormers_match_ids, existing_h2h)
+
+if (length(new_h2h_ids) > 0) {
+  n_h2h <- 0L
+  start_h2h <- tryCatch(table_row_count(con, "head_to_head"), error = function(e) 0L)
+  for (mid in new_h2h_ids) {
+    raw <- oval_get(glue("/headtohead/{mid}"))
+    if (is.null(raw)) next
+    h2h  <- raw$headToHeadStats
+    home <- raw$teams$homeTeam
+    away <- raw$teams$awayTeam
+    if (is.null(h2h)) next
+    last5_str <- tryCatch({
+      m5 <- h2h$last5Matches
+      if (is.null(m5) || length(m5) == 0) NA_character_
+      else paste(sapply(m5, function(x) if (is.list(x))
+        paste(names(x), unlist(x), sep="=", collapse=";") else as.character(x)), collapse=" | ")
+    }, error = function(e) NA_character_)
+    form_str <- tryCatch({
+      f <- h2h$form
+      if (is.null(f)) NA_character_ else if (is.character(f)) f else paste(unlist(f), collapse="")
+    }, error = function(e) NA_character_)
+    row <- tibble(
+      match_id = mid,
+      home_team_id = safe_int(home$id), home_team_name = safe_chr(home$name),
+      away_team_id = safe_int(away$id), away_team_name = safe_chr(away$name),
+      total_matches = safe_int(h2h$totalMatches),
+      home_wins = safe_int(h2h$homeTeamWins), away_wins = safe_int(h2h$awayTeamWins),
+      draws = safe_int(h2h$draws),
+      home_win_pct = safe_dbl(h2h$homeTeamWinPercentage),
+      away_win_pct = safe_dbl(h2h$awayTeamWinPercentage),
+      draw_pct = safe_dbl(h2h$drawPercentage),
+      biggest_win_margin = safe_int(h2h$biggestWinMargin),
+      wins_at_venue = safe_int(h2h$winsAtVenue), neutral_wins = safe_int(h2h$neutralWins),
+      total_points_scored = safe_int(h2h$totalPointsScored),
+      total_tries_scored = safe_int(h2h$totalTriesScored),
+      last_5_matches = last5_str, form = form_str
+    )
+    dbAppendTable(con, "head_to_head", row)
+    n_h2h <- n_h2h + 1L
+  }
+  end_h2h <- tryCatch(table_row_count(con, "head_to_head"), error = function(e) start_h2h + n_h2h)
+  if (end_h2h < start_h2h + n_h2h) warning("head_to_head count is lower than expected after append.")
+  log_count("head_to_head", n_h2h, end_h2h)
+} else {
+  message("  ✓ head_to_head: no new Stormers matches")
+}
+```
+
+## 4. Season-Level Tables (always refresh)
+
+```{r standings}
+fetch_standings <- function(comp_id, comp_name) {
+  raw <- oval_get(glue("/standing/search?compId={comp_id}&seasonId={SEASON_ID}"))
+  if (is.null(raw)) return(tibble())
+  teams_raw <- raw$groups %||% raw$standings %||% raw
+  if (is.null(teams_raw) || length(teams_raw) == 0) return(tibble())
+  map_dfr(teams_raw, function(t) tibble(
+    competition_id = comp_id, competition = comp_name, season_id = SEASON_ID,
+    position = safe_int(t$position), team_id = safe_int(t$team$id),
+    team_name = safe_chr(t$team$name), team_short_name = safe_chr(t$team$shortName),
+    played = safe_int(t$played), won = safe_int(t$won), drawn = safe_int(t$drawn),
+    lost = safe_int(t$lost), byes = safe_int(t$byes),
+    points_for = safe_int(t$pointsFor), points_against = safe_int(t$pointsAgainst),
+    point_diff = safe_int(t$pointsDiff), tries_for = safe_int(t$triesFor),
+    tries_against = safe_int(t$triesAgainst), bonus_pts_win = safe_int(t$bonus),
+    bonus_pts_try = safe_int(t$triesBonus), bonus_pts_loss = safe_int(t$losingBonus),
+    league_points = safe_int(t$points),
+    points_percentage = safe_dbl(t$pointsPercentage),
+    points_scored_pct = safe_dbl(t$pointsScoredPercentage)
+  ))
+}
+standings <- bind_rows(
+  fetch_standings(URC_ID, "United Rugby Championship"),
+  fetch_standings(CHAMPS_ID, "European Rugby Champions Cup")
+)
+refresh_table(con, "standings", standings)
+log_count("standings", nrow(standings), table_row_count(con, "standings"))
+```
+
+```{r round_standings}
+max_rounds <- matches |>
+  filter(finalised == 1) |>
+  group_by(competition_id) |>
+  summarise(max_round = max(round, na.rm = TRUE), .groups = "drop")
+max_rounds <- max_rounds |>
+  filter(!is.infinite(max_round), !is.na(max_round), max_round > 0)
+
+rs_list <- list()
+if (nrow(max_rounds) > 0) {
+  for (i in seq_len(nrow(max_rounds))) {
+    cid   <- max_rounds$competition_id[i]
+    cname <- if (cid == URC_ID) "United Rugby Championship" else "European Rugby Champions Cup"
+    for (rnd in seq_len(max_rounds$max_round[i])) {
+      raw <- oval_get(glue("/roundstanding/search?compId={cid}&seasonId={SEASON_ID}&round={rnd}"))
+      if (is.null(raw)) next
+      teams_raw <- raw$groups %||% raw$standings %||% raw
+      if (is.null(teams_raw) || length(teams_raw) == 0) next
+      rows <- map_dfr(teams_raw, function(t) tibble(
+        competition_id = cid, competition = cname, season_id = SEASON_ID, round = rnd,
+        position = safe_int(t$position), team_id = safe_int(t$team$id),
+        team_name = safe_chr(t$team$name), team_short_name = safe_chr(t$team$shortName),
+        played = safe_int(t$played), won = safe_int(t$won), drawn = safe_int(t$drawn),
+        lost = safe_int(t$lost), byes = safe_int(t$byes),
+        points_for = safe_int(t$pointsFor), points_against = safe_int(t$pointsAgainst),
+        point_diff = safe_int(t$pointsDiff), tries_for = safe_int(t$triesFor),
+        tries_against = safe_int(t$triesAgainst), bonus_pts_win = safe_int(t$bonus),
+        bonus_pts_try = safe_int(t$triesBonus), bonus_pts_loss = safe_int(t$losingBonus),
+        league_points = safe_int(t$points), points_percentage = safe_dbl(t$pointsPercentage),
+        points_scored_pct = safe_dbl(t$pointsScoredPercentage)
+      ))
+      if (nrow(rows) > 0) rs_list[[length(rs_list) + 1]] <-
+        rows |> distinct(competition_id, round, team_id, .keep_all = TRUE)
+    }
+  }
+}
+round_standings <- bind_rows(rs_list)
+refresh_table(con, "round_standings", round_standings)
+log_count("round_standings", nrow(round_standings), table_row_count(con, "round_standings"))
+```
+
+```{r season_stats}
+fetch_season_stats <- function(comp_id, comp_name) {
+  raw <- oval_get(glue("/seasonstats/search?compId={comp_id}&seasonId={SEASON_ID}&coverage=performance"))
+  if (is.null(raw)) return(tibble())
+  teams_raw <- raw$stats %||% raw$groups %||% raw
+  if (is.null(teams_raw) || length(teams_raw) == 0) return(tibble())
+  map_dfr(teams_raw, function(obj) {
+    t <- obj$team; s <- obj$teamStats
+    if (is.null(s)) return(tibble())
+    tibble(
+      competition_id = comp_id, competition = comp_name, season_id = SEASON_ID,
+      team_id = safe_int(t$id), team_name = safe_chr(t$name),
+      total_carries = safe_int(s$attack$carries), total_metres_made = safe_int(s$attack$metresMade),
+      total_passes = safe_int(s$attack$passes), total_clean_breaks = safe_int(s$attack$cleanBreak),
+      total_defenders_beaten = safe_int(s$attack$defenderBeaten),
+      total_try_assists = safe_int(s$attack$tryAssist), total_offloads = safe_int(s$attack$offload),
+      total_turnovers_conceded = safe_int(s$attack$totalTurnovers),
+      total_post_contact_metres = safe_int(s$attack$postContactMetres),
+      total_break_assists = safe_int(s$attack$breakAssist),
+      total_dominant_carries = safe_int(s$attack$dominantContact),
+      total_carry_distance = safe_int(s$attack$carryDistance),
+      total_metres_in_contact = safe_int(s$attack$metresInContact),
+      total_crossed_gainline = safe_int(s$attack$crossedGainline),
+      total_failed_gainline = safe_int(s$attack$failedGainline),
+      total_handling_errors = safe_int(s$attack$handlingError),
+      total_errors = safe_int(s$attack$errors),
+      total_tries = safe_int(s$scoring$tryScored), total_points = safe_int(s$scoring$points),
+      total_conversions = safe_int(s$scoring$conversion),
+      total_penalties_made = safe_int(s$scoring$penaltyGoal),
+      total_missed_conversions = safe_int(s$scoring$missedConversion),
+      total_missed_penalties = safe_int(s$scoring$missedPenaltyGoal),
+      total_penalty_tries = safe_int(s$scoring$penaltyTry),
+      goal_success_pct = safe_dbl(s$scoring$percentGoals),
+      total_tackles_made = safe_int(s$defence$totalSuccessfulTackles),
+      total_tackles_missed = safe_int(s$defence$totalUnsuccessfulTackles),
+      tackle_success_pct = safe_dbl(s$defence$percentTackleMade),
+      total_turnovers_won = safe_int(s$defence$turnoverWon),
+      lineout_throws_won = safe_int(s$lineout$lineoutThrowsWon),
+      lineout_success_pct = safe_dbl(s$lineout$percentLineoutsWon),
+      total_kicks_in_play = safe_int(s$kicking$kicksInPlay),
+      total_kick_metres = safe_int(s$kicking$kickMetres),
+      scrums_won = safe_int(s$scrum$scrumsWon),
+      scrum_success_pct = safe_dbl(s$scrum$percentScrumsWon),
+      total_penalties_con = safe_int(s$discipline$penaltyConceded),
+      total_yellow_cards = safe_int(s$discipline$yellowCard),
+      total_red_cards = safe_int(s$discipline$redCard),
+      rucks_won = safe_int(s$possession$numRucksWon), rucks_lost = safe_int(s$possession$numRucksLost),
+      mauls_won = safe_int(s$possession$maulsWon), mauls_lost = safe_int(s$possession$maulsLost),
+      maul_success_pct = safe_dbl(s$possession$percentMaulsWon),
+      visits_to_22 = safe_int(s$possession$numVisitsTo22),
+      points_from_22_visits = safe_int(s$possession$pointsFromVisitsTo22),
+      possession_pct = safe_dbl(s$possession$percentPossession),
+      territory_pct = safe_dbl(s$possession$percentTerritory),
+      total_restarts = safe_int(s$restart$totalRestarts),
+      restarts_retained = safe_int(s$restart$restartsRetained),
+      restart_success_pct = safe_dbl(s$restart$percentRestartsRetained),
+      attacking_catches = safe_int(s$ballReception$attackingCatch),
+      attacking_catch_success = safe_int(s$ballReception$attackingCatchSuccess),
+      defensive_catches = safe_int(s$ballReception$defensiveCatch),
+      restart_catches = safe_int(s$ballReception$restartCatch),
+      aerial_contests = safe_int(s$ballReception$aerialContest),
+      aerial_contests_won = safe_int(s$ballReception$aerialContestWon),
+      aerial_contest_pct = safe_dbl(s$ballReception$percentAerialContestWon),
+      ruck_entries_attacking = safe_int(s$rucks$attackingRuckEntries),
+      ruck_entries_defensive = safe_int(s$rucks$defensiveRuckEntries),
+      ruck_entries_total = safe_int(s$rucks$totalRuckEntries),
+      ruck_nuisance = safe_int(s$rucks$nuisance),
+      ruck_nuisance_jackal = safe_int(s$rucks$nuisanceJackal)
+    )
+  })
+}
+season_stats <- bind_rows(
+  fetch_season_stats(URC_ID, "United Rugby Championship"),
+  fetch_season_stats(CHAMPS_ID, "European Rugby Champions Cup")
+)
+refresh_table(con, "season_stats", season_stats)
+log_count("season_stats", nrow(season_stats), table_row_count(con, "season_stats"))
+```
+
+```{r squad}
+fetch_all_squads <- function(comp_id, comp_name) {
+  team_ids <- bind_rows(
+    matches |> filter(competition_id == comp_id) |> select(team_id = home_team_id, team_name = home_team),
+    matches |> filter(competition_id == comp_id) |> select(team_id = away_team_id, team_name = away_team)
+  ) |> distinct(team_id, .keep_all = TRUE) |> filter(!is.na(team_id))
+  map_dfr(seq_len(nrow(team_ids)), function(i) {
+    tid <- team_ids$team_id[i]; tname <- team_ids$team_name[i]
+    squad_raw <- oval_get(glue("/team/{tid}"))
+    if (is.null(squad_raw)) return(tibble())
+    players_raw <- NULL
+    if (!is.null(squad_raw$teams) && length(squad_raw$teams) > 0) players_raw <- squad_raw$teams[[1]]$squad
+    if (is.null(players_raw)) players_raw <- squad_raw$players
+    if (is.null(players_raw)) players_raw <- squad_raw$squad
+    if (is.null(players_raw) || !is.list(players_raw) || length(players_raw) == 0) return(tibble())
+    map_dfr(players_raw, function(p) {
+      fn <- safe_chr(p$firstName); ln <- safe_chr(p$lastName)
+      full_name <- if (!is.na(fn) && !is.na(ln)) paste(fn, ln) else coalesce(fn, ln, NA_character_)
+      tibble(
+        competition_id = comp_id, competition = comp_name, team_id = tid, team_name = tname,
+        player_id = safe_int(p$id), player_name = full_name,
+        known_name = safe_chr(p$knownName), first_name = fn, last_name = ln,
+        position = if (is.list(p$normalPosition)) safe_chr(p$normalPosition$name) else safe_chr(p$normalPosition),
+        gender = safe_chr(p$gender), date_of_birth = safe_chr(p$dob),
+        birthplace = safe_chr(p$birthplace), country_of_birth = safe_chr(p$countryOfBirth),
+        national_team = if (is.list(p$nationalTeam)) safe_chr(p$nationalTeam$name) else safe_chr(p$nationalTeam),
+        height_cm = safe_int(p$height), weight_kg = safe_int(p$weight)
+      )
+    })
+  })
+}
+squad <- bind_rows(
+  fetch_all_squads(URC_ID,    "United Rugby Championship"),
+  fetch_all_squads(CHAMPS_ID, "European Rugby Champions Cup")
+) |> distinct(competition_id, team_id, player_id, .keep_all = TRUE)
+refresh_table(con, "squad", squad)
+log_count("squad", nrow(squad), table_row_count(con, "squad"))
+```
+
+```{r venues_officials}
+fetch_venues <- function(comp_id, comp_name) {
+  raw <- oval_get(glue("/venue/search?compId={comp_id}&seasonId={SEASON_ID}"))
+  if (is.null(raw)) return(tibble())
+  venues_raw <- if (!is.null(raw$venues)) raw$venues else raw
+  map_dfr(venues_raw, function(v) {
+    country_val <- if (is.list(v$country)) safe_chr(v$country$name) else safe_chr(v$country)
+    country_id_val <- if (is.list(v$country)) safe_int(v$country$id) else NA_integer_
+    tibble(
+      competition_id = comp_id, competition = comp_name,
+      venue_id = safe_int(v$id), venue_name = safe_chr(v$name), location = safe_chr(v$location),
+      country_id = country_id_val, country = country_val, timezone = safe_chr(v$timezone),
+      capacity = safe_int(v$capacity), roof = safe_chr(v$roof), surface = safe_chr(v$surface),
+      year_built = safe_int(v$yearBuilt), latitude = safe_dbl(v$latitude), longitude = safe_dbl(v$longitude)
+    )
+  })
+}
+venues <- bind_rows(
+  fetch_venues(URC_ID, "United Rugby Championship"),
+  fetch_venues(CHAMPS_ID, "European Rugby Champions Cup")
+) |> distinct(competition_id, venue_id, .keep_all = TRUE)
+refresh_table(con, "venues", venues)
+log_count("venues", nrow(venues), table_row_count(con, "venues"))
+
+fetch_officials <- function(comp_id, comp_name) {
+  raw <- oval_get(glue("/official/search?compId={comp_id}&seasonId={SEASON_ID}"))
+  if (is.null(raw)) return(tibble())
+  officials_raw <- if (!is.null(raw$officials)) raw$officials else raw
+  map_dfr(officials_raw, function(o) {
+    country_val <- if (is.list(o$country)) safe_chr(o$country$name) else safe_chr(o$country)
+    tibble(
+      competition_id = comp_id, competition = comp_name,
+      official_id = safe_int(o$id), first_name = safe_chr(o$firstName),
+      last_name = safe_chr(o$lastName), known_name = safe_chr(o$knownName),
+      initials = safe_chr(o$initials), gender = safe_chr(o$gender),
+      dob = safe_chr(o$dob), country = country_val
+    )
+  })
+}
+officials <- bind_rows(
+  fetch_officials(URC_ID, "United Rugby Championship"),
+  fetch_officials(CHAMPS_ID, "European Rugby Champions Cup")
+) |> distinct(competition_id, official_id, .keep_all = TRUE)
+refresh_table(con, "officials", officials)
+log_count("officials", nrow(officials), table_row_count(con, "officials"))
+```
+
+```{r leaderboards}
+stat_ids <- c(
+  tries = "tryScored", points = "points", carries = "carries",
+  metres_made = "carryMetresMade", metres_per_carry = "metresPerCarry",
+  defenders_beaten = "defenderBeaten", try_assists = "tryAssist",
+  tackles_made = "totalSuccessfulTackles", tackle_success = "tackleSuccessPercent",
+  missed_tackles = "missedTackle", turnovers_won = "totalTurnoversWon",
+  jackals = "totalJackals", lineout_throws = "lineoutThrowsWon",
+  lineout_success = "lineoutSuccessPercent", kick_metres = "kickMetres",
+  post_contact_metres = "postContactMetres", offloads = "offload",
+  initial_breaks = "initialBreak"
+)
+
+player_top10_list <- list()
+team_top_list     <- list()
+
+for (comp_id in c(URC_ID, CHAMPS_ID)) {
+  comp_name <- if (comp_id == URC_ID) "United Rugby Championship" else "European Rugby Champions Cup"
+  for (stat_name in names(stat_ids)) {
+    stat_str <- stat_ids[[stat_name]]
+    # Player top 10
+    raw <- oval_get(glue("/playertop10stats?compId={comp_id}&seasonId={SEASON_ID}&stat={stat_str}"))
+    if (!is.null(raw) && !is.null(raw$stats)) {
+      for (metric_type in c("total", "per80")) {
+        metric_stats <- raw$stats[[metric_type]]
+        if (is.null(metric_stats)) next
+        players_raw <- metric_stats[[stat_str]]
+        if (is.null(players_raw) || length(players_raw) == 0) next
+        rows <- map_dfr(players_raw, function(p) tibble(
+          competition_id = comp_id, competition = comp_name,
+          stat_name = stat_name, stat_api_key = stat_str, metric_type = metric_type,
+          rank = safe_int(p$rank), player_id = safe_int(p$playerId),
+          player_name = safe_chr(p$playerName), team_id = safe_int(p$teamId),
+          team_name = safe_chr(p$teamName), appearances = safe_int(p$appearances),
+          minutes_played = safe_int(p$minutesPlayed), stat_value = safe_dbl(p$value)
+        ))
+        player_top10_list[[length(player_top10_list) + 1]] <- rows
+      }
+    }
+    # Team top stats
+    raw2 <- oval_get(glue("/teamtopstats?compId={comp_id}&seasonId={SEASON_ID}&stat={stat_str}"))
+    if (!is.null(raw2) && !is.null(raw2$stats)) {
+      for (metric_type in c("total", "perMatch")) {
+        metric_stats <- raw2$stats[[metric_type]]
+        if (is.null(metric_stats)) next
+        teams_raw <- metric_stats[[stat_str]]
+        if (is.null(teams_raw) || length(teams_raw) == 0) next
+        rows <- map_dfr(teams_raw, function(t) tibble(
+          competition_id = comp_id, competition = comp_name,
+          stat_name = stat_name, stat_api_key = stat_str, metric_type = metric_type,
+          rank = safe_int(t$rank), team_id = safe_int(t$teamId),
+          team_name = safe_chr(t$teamName), stat_value = safe_dbl(t$value)
+        ))
+        team_top_list[[length(team_top_list) + 1]] <- rows
+      }
+    }
+  }
+}
+
+player_top10   <- bind_rows(player_top10_list)
+team_top_stats <- bind_rows(team_top_list)
+refresh_table(con, "player_top10",   player_top10)
+refresh_table(con, "team_top_stats", team_top_stats)
+log_count("player_top10",   nrow(player_top10),   table_row_count(con, "player_top10"))
+log_count("team_top_stats", nrow(team_top_stats), table_row_count(con, "team_top_stats"))
+```
+
+## Summary
+
+```{r summary_table}
+dbDisconnect(con)
+elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "mins")), 1)
+
+summary_df <- tibble(
+  Table                = names(counts),
+  `New rows added`     = sapply(counts, `[[`, "new"),
+  `Total rows in DB`   = sapply(counts, `[[`, "total")
+)
+knitr::kable(summary_df, format = "html")
+```
+
+**Run completed in `r elapsed` minutes at `r format(Sys.time(), "%Y-%m-%d %H:%M %Z")`.**
